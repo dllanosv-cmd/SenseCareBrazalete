@@ -1,0 +1,22 @@
+
+[env:esp32dev]
+platform = espressif32
+board = esp32dev
+framework = arduino
+lib_deps = 
+	devxplained/MAX3010x Sensor Library@^1.0.5
+	adafruit/Adafruit SSD1306@2.5.13
+	mobizt/Firebase ESP32 Client@4.4.10
+monitor_speed = 115200
+
+
+
+ // Estado inicial: todos en verde
+  digitalWrite(BPM_LED_GREEN, LOW);   // verde encendido (ánodo común)
+  digitalWrite(BPM_LED_RED, HIGH);    // rojo apagado
+  
+  digitalWrite(SPO2_LED_GREEN, LOW);
+  digitalWrite(SPO2_LED_RED, HIGH);
+  
+  digitalWrite(TEMP_LED_GREEN, LOW);
+  digitalWrite(TEMP_LED_RED, HIGH);

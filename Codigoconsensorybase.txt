@@ -1,0 +1,232 @@
+#include <MAX3010x.h>
+#include <Adafruit_SSD1306.h>
+#include "filters.h"
+#include <Arduino.h>
+#include <Adafruit_GFX.h>
+#include <FirebaseESP32.h>
+
+#if defined(ESP32)
+  #include <WiFi.h>
+#elif defined(ESP8266)
+  #include <ESP8266WiFi.h>
+#endif
+
+// Configuración WiFi y Firebase
+#define WIFI_SSID "extensordewifi8.5G"
+#define WIFI_PASSWORD "tplinkllanos8"
+#define FIREBASE_HOST "maxesp32-e9124-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH "AIzaSyBvLJjVUC9DcJ5xXWC5Evca6tWYkxIPwhs"
+#define LED 2
+
+FirebaseData fbdo;
+
+// Pantalla OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Sensor
+MAX30105 sensor;
+const auto kSamplingRate = sensor.SAMPLING_RATE_400SPS;
+const float kSamplingFrequency = 400.0;
+const unsigned long kFingerThreshold = 10000;
+const unsigned int kFingerCooldownMs = 500;
+const float kEdgeThreshold = -2000.0;
+
+// Filtros
+const float kLowPassCutoff = 5.0;
+const float kHighPassCutoff = 0.5;
+const bool kEnableAveraging = true;
+const int kAveragingSamples = 5;
+const int kSampleThreshold = 5;
+
+LowPassFilter low_pass_filter_red(kLowPassCutoff, kSamplingFrequency);
+LowPassFilter low_pass_filter_ir(kLowPassCutoff, kSamplingFrequency);
+HighPassFilter high_pass_filter(kHighPassCutoff, kSamplingFrequency);
+Differentiator differentiator(kSamplingFrequency);
+MovingAverageFilter<kAveragingSamples> averager_bpm;
+MovingAverageFilter<kAveragingSamples> averager_r;
+MovingAverageFilter<kAveragingSamples> averager_spo2;
+MinMaxAvgStatistic stat_red;
+MinMaxAvgStatistic stat_ir;
+
+float kSpO2_A = 1.5958422;
+float kSpO2_B = -34.6596622;
+float kSpO2_C = 112.6898759;
+
+long last_heartbeat = 0;
+long finger_timestamp = 0;
+bool finger_detected = false;
+float last_diff = NAN;
+bool crossed = false;
+long crossed_time = 0;
+bool display_reset = true;
+
+unsigned long sendDataPrevMillis = 0;
+const long timerDelay = 5000;
+
+void initDrawScreen(void);
+void displayMeasuredValues(bool no_finger, int32_t beatAvg, int32_t spo2, float temperature);
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED, OUTPUT);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Conectando a WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi conectado");
+
+  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
+  Firebase.reconnectWiFi(true);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("Fallo al iniciar OLED"));
+    while (1);
+  }
+
+  if (sensor.begin() && sensor.setSamplingRate(kSamplingRate)) {
+    Serial.println("Sensor MAX30105 inicializado");
+  } else {
+    Serial.println("No se detectó el sensor MAX30105");
+    while (1);
+  }
+
+  display.clearDisplay();
+  initDrawScreen();
+}
+
+void loop() {
+  auto sample = sensor.readSample(1000);
+  float temperature = sensor.readTemperature();
+  float current_value_red = sample.red;
+  float current_value_ir = sample.ir;
+
+  if (sample.red > kFingerThreshold) {
+    if (millis() - finger_timestamp > kFingerCooldownMs) {
+      finger_detected = true;
+    }
+  } else {
+    differentiator.reset();
+    averager_bpm.reset();
+    averager_r.reset();
+    averager_spo2.reset();
+    low_pass_filter_red.reset();
+    low_pass_filter_ir.reset();
+    high_pass_filter.reset();
+    stat_red.reset();
+    stat_ir.reset();
+    finger_detected = false;
+    finger_timestamp = millis();
+  }
+
+  if (finger_detected) {
+    displayMeasuredValues(false, 0, 0, temperature);
+    current_value_red = low_pass_filter_red.process(current_value_red);
+    current_value_ir = low_pass_filter_ir.process(current_value_ir);
+    stat_red.process(current_value_red);
+    stat_ir.process(current_value_ir);
+
+    float current_value = high_pass_filter.process(current_value_red);
+    float current_diff = differentiator.process(current_value);
+
+    if (!isnan(current_diff) && !isnan(last_diff)) {
+      if (last_diff > 0 && current_diff < 0) {
+        crossed = true;
+        crossed_time = millis();
+      }
+
+      if (current_diff > 0) crossed = false;
+
+      if (crossed && current_diff < kEdgeThreshold) {
+        if (last_heartbeat != 0 && crossed_time - last_heartbeat > 300) {
+          int bpm = 60000 / (crossed_time - last_heartbeat);
+          float rred = (stat_red.maximum() - stat_red.minimum()) / stat_red.average();
+          float rir = (stat_ir.maximum() - stat_ir.minimum()) / stat_ir.average();
+          float r = rred / rir;
+          float spo2 = kSpO2_A * r * r + kSpO2_B * r + kSpO2_C;
+
+          if (bpm > 50 && bpm < 250) {
+            int average_bpm = kEnableAveraging ? averager_bpm.process(bpm) : bpm;
+            int average_spo2 = kEnableAveraging ? averager_spo2.process(spo2) : spo2;
+
+            if (!kEnableAveraging || averager_bpm.count() >= kSampleThreshold) {
+              displayMeasuredValues(false, average_bpm, average_spo2, temperature);
+
+              if (millis() - sendDataPrevMillis > timerDelay || sendDataPrevMillis == 0) {
+                sendDataPrevMillis = millis();
+                digitalWrite(LED, HIGH);
+
+                Firebase.setInt(&fbdo, "/bpm", average_bpm);
+                Firebase.setInt(&fbdo, "/spo2", average_spo2);
+                Firebase.setFloat(&fbdo, "/temperatura", temperature);
+
+                digitalWrite(LED, LOW);
+              }
+            }
+          }
+          stat_red.reset();
+          stat_ir.reset();
+        }
+        crossed = false;
+        last_heartbeat = crossed_time;
+      }
+    }
+    last_diff = current_diff;
+  } else {
+    displayMeasuredValues(true, 0, 0, temperature);
+  }
+}
+
+void initDrawScreen(void) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println(F("    Taste The Code"));
+  display.setCursor(5, display.getCursorY() + 5);
+  display.setTextSize(2);
+  display.println(F("BPM  SpO2  Temp"));
+  display.display();
+}
+
+void displayMeasuredValues(bool no_finger, int32_t beatAvg, int32_t spo2, float temperature) {
+  display.clearDisplay();
+  display.setTextColor(WHITE);
+
+  if (no_finger) {
+    display.setTextSize(2);
+    display.setCursor(5, 10);
+    display.println(F("NO Signal"));
+    display.display();
+    display_reset = true;
+  } else if (beatAvg < 30 && display_reset) {
+    display.setTextSize(2);
+    display.setCursor(5, 10);
+    display.println(F("Pls. Wait"));
+    display.display();
+    display_reset = false;
+  } else if (beatAvg >= 30) {
+    display.setTextSize(2);
+    display.setCursor(0, 0);
+    display.print(F("BPM: "));
+    display.println(beatAvg);
+    display.setCursor(0, 20);
+    display.print(F("SpO2: "));
+    if (spo2 >= 20 && spo2 <= 100) {
+      display.print(spo2);
+    } else {
+      display.print(F("--"));
+    }
+    display.println(F("%"));
+    display.setCursor(0, 40);
+    display.print(F("Tmp: "));
+    display.print(temperature, 1);
+    display.println(F("C"));
+    display.display();
+  }
+}
